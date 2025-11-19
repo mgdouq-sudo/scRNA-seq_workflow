@@ -1,0 +1,3 @@
+sample,ftp
+hipp_rep1,ftp://ftp.sra.ebi.ac.uk/vol1/run/SRR126/SRR12699079/HIPP_sc_Rep1_10X.bam.1
+hipp_rep2,ftp://ftp.sra.ebi.ac.uk/vol1/run/SRR126/SRR12699080/HIPP_sc_Rep2_10X.bam.1
