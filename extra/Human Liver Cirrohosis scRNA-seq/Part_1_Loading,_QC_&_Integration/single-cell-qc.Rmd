@@ -1,0 +1,1086 @@
+---
+title: "Human Liver Cirrhosis scRNA-seq — Part 1: Loading, QC & Integration"
+subtitle: "Ramachandran et al. 2019 | GSE136103"
+author: ""
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 10,
+  fig.height = 6
+)
+```
+
+---
+
+## Learning Objectives
+
+By the end of this exercise you will be able to:
+
+1. Load 10X Genomics count matrices into Seurat and understand the object structure
+2. Calculate and interpret standard single-cell QC metrics
+3. Apply adaptive MAD-based filtering rather than arbitrary hard cutoffs
+4. Detect and remove putative doublets on a per-sample basis
+5. Merge multiple samples and understand why donor batch correction is necessary
+6. Run Harmony integration and evaluate whether it has worked
+
+**Estimated time:** 2–3 hours
+
+---
+
+## Background
+
+Ramachandran et al. (2019, *Nature*) profiled the transcriptomes of more than 100,000 single
+cells from healthy and cirrhotic human liver. Their key finding was a novel
+**TREM2+CD9+ macrophage subpopulation** that expands in liver fibrosis. They also identified
+**ACKR1+** and **PLVAP+** endothelial cells restricted to the fibrotic scar.
+
+The dataset (GEO accession **GSE136103**) contains cells from:
+
+- **5 healthy donors** and **5 cirrhotic donors** (causes: NAFLD, alcohol, PBC)
+- Two sorted fractions per donor: **CD45+** (immune cells) and **CD45−** (endothelial,
+  mesenchymal cells)
+- Some donors have their CD45− fraction split across **two sequencing lanes (A and B)**
+
+In Part 1 we focus entirely on producing a clean, well-annotated Seurat object ready for
+clustering and biological interpretation in Part 2.
+
+---
+
+## 0. Libraries
+
+▶ **Provided** — run this chunk as-is. Most of these packages should be pre-installed
+on the SCC.
+
+```{r libraries}
+library(Seurat)       # core single-cell analysis framework
+library(tidyverse)    # data wrangling (dplyr, tidyr) and plotting (ggplot2)
+library(patchwork)    # arrange multiple ggplot panels side by side
+library(scuttle)      # MAD-based QC filtering (Bioconductor)
+library(scDblFinder)  # doublet detection (Bioconductor)
+library(harmony)      # batch integration
+
+set.seed(42)  # fix random seed for reproducibility
+```
+
+```{r}
+BiocManager::install("scDblFinder")
+```
+
+---
+
+## 1. Understanding the Data Structure
+
+Before writing any code, let us understand what files we have and how they are organised.
+
+Each sample has three files that together define the count matrix:
+
+| File | Contents |
+|------|----------|
+| `barcodes.tsv.gz` | One cell barcode per row — each barcode is one cell |
+| `features.tsv.gz` | One gene per row |
+| `matrix.mtx.gz` | The counts in sparse format: (gene index, cell index, count) |
+
+After reorganising the downloaded files, each sample lives in its own subdirectory:
+
+```
+data/
+├── GSM4041150_healthy1_cd45+/
+│   ├── barcodes.tsv.gz
+│   ├── features.tsv.gz
+│   └── matrix.mtx.gz
+├── GSM4041151_healthy1_cd45-A/
+│   └── ...
+```
+
+You may find the data on the cluster at /projectnb/bf530/materials/lab11-data/data/
+
+> **Question 1:** Each donor has a `cd45+` and a `cd45-` fraction. What cell types would
+> you expect to find in each? Why might the authors have sorted cells rather than loading
+> an unsorted suspension?
+>
+> *Your answer:*
+
+▶ **Provided** — set your data path and list the sample directories.
+
+```{r data-dir}
+# Set this to the folder listed above
+data_dir <- "/projectnb/bf530/materials/lab11-data/data/"   # <-- adjust this path if needed
+
+# list.dirs() returns the path of every subdirectory inside data_dir
+# recursive = FALSE means we only go one level deep (we don't want subdirectories
+# of subdirectories)
+# full.names = TRUE means we get the complete path, not just the folder name
+sample_dirs  <- list.dirs(data_dir, recursive = FALSE, full.names = TRUE)
+
+# basename() strips the directory path and keeps only the final folder name
+# e.g. "data/GSM4041150_healthy1_cd45+" becomes "GSM4041150_healthy1_cd45+"
+sample_names <- basename(sample_dirs)
+
+cat("Number of samples found:", length(sample_names), "\n\n")
+print(sample_names)
+```
+
+### 1.1 Sample Metadata
+
+▶ **Provided** — There's metadata table so you can join sample information without
+parsing filenames.
+
+```{r metadata}
+sample_meta <- read.csv("samplesheet.tsv", sep = "\t", stringsAsFactors = FALSE)
+print(sample_meta)
+
+# or equivalently: sample_meta <- read.delim("samplesheet.tsv", stringsAsFactors = FALSE)
+
+```
+
+| Column | Meaning |
+|--------|---------|
+| `sample_name` | Directory name |
+| `donor` | Donor ID (e.g. healthy1, cirrhotic3) |
+| `condition` | healthy or cirrhotic |
+| `fraction` | cd45pos or cd45neg |
+| `etiology` | healthy, NAFLD, alcohol, or PBC |
+| `lane` | single, A, or B |
+
+---
+
+## 2. Loading a Single Sample
+
+We always load one sample by hand first to understand what we are creating before
+automating it across all samples. It is much easier to debug a problem with one object
+than to realise something went wrong after processing twenty of them.
+
+▶ **Provided** — load the first sample and inspect the raw count matrix.
+
+```{r load-one}
+path_one   <- sample_dirs[1]
+sample_one <- sample_names[1]
+
+cat("Loading:", sample_one, "\n\n")
+
+# Read10X() is Seurat's function for reading 10X Genomics output.
+# It reads all three files in the directory simultaneously and assembles them
+# into a single sparse matrix where rows are genes and columns are cell barcodes.
+# It handles the .gz compression automatically.
+counts_one <- Read10X(data.dir = path_one)
+
+cat("Dimensions (genes x cells):", dim(counts_one), "\n")
+```
+
+```{r inspect-counts}
+# The . characters represent zeros -- this is how R displays sparse matrices.
+# Most entries are zero because each cell only expresses a fraction of all genes.
+# This sparsity is normal and expected in single-cell data.
+counts_one[1:6, 1:6]
+```
+
+▶ **Provided** — create a Seurat object and explore its structure.
+
+```{r create-seurat-one}
+# CreateSeuratObject() wraps the raw count matrix in a Seurat object,
+# which is a structured container that will hold our data, metadata, and
+# analysis results throughout the exercise.
+#
+# min.cells = 3 : drop any gene that appears in fewer than 3 cells.
+#   These very sparse genes add noise and memory usage without contributing
+#   useful information for identifying cell types.
+#
+# min.features = 200 : drop any cell (barcode) with fewer than 200 genes detected.
+#   Barcodes with very few genes are almost certainly empty droplets that captured
+#   only a small amount of ambient RNA, not a real cell.
+so_one <- CreateSeuratObject(
+  counts       = counts_one,
+  project      = sample_one,
+  min.cells    = 3,
+  min.features = 200
+)
+
+so_one  # printing a Seurat object shows a brief summary
+```
+
+```{r explore-seurat}
+# nrow() and ncol() work on Seurat objects: rows = genes, columns = cells
+cat("Genes:", nrow(so_one), "\n")
+cat("Cells:", ncol(so_one), "\n\n")
+
+# colnames() returns the cell barcodes (one per cell)
+cat("First 6 cell barcodes:\n")
+head(colnames(so_one))
+
+# rownames() returns the gene names
+cat("\nFirst 6 gene names:\n")
+head(rownames(so_one))
+
+# @meta.data is a data frame with one row per cell.
+# It stores per-cell information: QC metrics, cluster labels, etc.
+# nCount_RNA and nFeature_RNA are added automatically by CreateSeuratObject.
+cat("\nMetadata (first 6 rows):\n")
+head(so_one@meta.data)
+```
+
+The `@meta.data` slot is a data frame with one row per cell. `CreateSeuratObject`
+automatically calculates `nCount_RNA` (total UMIs) and `nFeature_RNA` (genes detected).
+We will add more columns throughout this exercise.
+
+---
+
+## 3. Loading All Samples
+
+Now we scale up from one sample to all samples. Rather than copying and pasting the
+loading code twenty times (error-prone and hard to maintain), we wrap it in a function
+and apply it to every sample automatically.
+
+**The pattern used here — `lapply()` and `mapply()`** — is fundamental in R and worth
+understanding:
+
+- `lapply(X, FUN)` applies a function `FUN` to each element of a list `X` and returns
+  a list of results. 
+- `mapply(FUN, arg1, arg2)` is similar but lets you vary multiple arguments at once —
+  here we need to pass both a file path and a sample name for each sample.
+
+Using these instead of a `for` loop means each sample is processed independently,
+the results are automatically collected into a list, and the code is shorter and
+less likely to contain indexing mistakes.
+
+▶ **Provided** — this function loads one sample and attaches metadata. Read it carefully
+before running.
+
+```{r load-all}
+# This function encapsulates everything needed to load one sample.
+# Writing it as a function means:
+# 1. We can test it on a single sample before running it on all of them
+# 2. The code only needs to be written once -- no copy-paste errors
+# 3. It is easy to add a step (e.g. extra QC metric) in one place
+load_one_sample <- function(path, sname, metadata_table) {
+  
+  counts <- Read10X(data.dir = path)
+  
+  so <- CreateSeuratObject(
+    counts       = counts,
+    project      = sname,
+    min.cells    = 3,
+    min.features = 200
+  )
+  
+  # filter() from dplyr finds the row in sample_meta that matches this sample.
+  # We then pull each column value out and attach it directly to the Seurat object.
+  # Attaching metadata now (before merging) means we never lose track of which
+  # cells came from which donor, condition, or fraction.
+  meta_row <- filter(metadata_table, sample_name == sname)
+  
+  so$sample    <- sname
+  so$donor     <- meta_row$donor
+  so$condition <- meta_row$condition
+  so$fraction  <- meta_row$fraction
+  so$etiology  <- meta_row$etiology
+  so$lane      <- meta_row$lane
+  
+  return(so)
+}
+
+# mapply() applies load_one_sample() to every sample simultaneously.
+# It pairs up sample_dirs[1] with sample_names[1], sample_dirs[2] with
+# sample_names[2], and so on. metadata_table is the same for every call
+# so it goes in MoreArgs.
+# SIMPLIFY = FALSE ensures the result stays as a list of Seurat objects
+# rather than being collapsed into a simpler structure.
+seurat_list <- mapply(
+  FUN         = load_one_sample,
+  path        = sample_dirs,
+  sname       = sample_names,
+  MoreArgs    = list(metadata_table = sample_meta),
+  SIMPLIFY    = FALSE
+)
+
+# Give each list element the name of its sample for easy access later
+names(seurat_list) <- sample_names
+
+# sapply() is like lapply() but tries to simplify the result.
+# Here ncol() returns a single number per sample, so sapply() gives
+# us a named numeric vector -- convenient for a quick overview.
+cat("Cells loaded per sample:\n")
+sapply(seurat_list, ncol)
+```
+
+Make a bar chart showing the number of cells per sample, coloured
+by condition (healthy vs cirrhotic). Use `ggplot2`. Hint: start from the `sapply()` output
+above and turn it into a data frame with `enframe()`.
+
+```{r cells-barplot}
+# Your code here
+sapply(seurat_list, ncol) %>%
+  tibble::enframe(name = "sample_name", value = "n_cells") %>%
+  left_join(sample_meta, by = "sample_name") %>%
+  ggplot(aes(x = sample_name, y = n_cells, fill = condition)) +
+  geom_col() +
+  scale_fill_manual(values = c("healthy" = "#4CAF50", "cirrhotic" = "#F44336")) +
+  labs(
+    title = "Number of cells per sample",
+    x     = "Sample",
+    y     = "Cell count",
+    fill  = "Condition"
+  ) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+**Question 3:** Cell counts vary considerably across samples. Is this a problem?
+ What biological or technical reasons might explain large differences in cell yield
+ between samples?
+
+
+
+---
+
+## 4. Merging the A/B Lanes
+
+Three donors had their CD45− fraction split across two sequencing lanes (A and B). These
+are the **same biological sample** run across two lanes to increase depth — they must be
+merged into one object before QC so they are treated as a single sample throughout.
+This is often done in bulk RNA sequencing as well where samples may be multiplexed
+across different lanes and you simply merge the reads together. 
+
+▶ **Provided** — this merging logic is roundabout;  run as-is. The actual mechanics
+are not the focus, just the reason for why we are merging. 
+
+```{r merge-ab}
+# This function finds A/B lane pairs, merges each pair into one Seurat object,
+# and leaves single-lane samples unchanged.
+merge_ab_lanes <- function(slist, meta) {
+  
+  # pull() extracts a column as a plain vector (rather than a one-column data frame).
+  # We get the names of all lane-A and lane-B samples from the metadata.
+  a_names <- meta %>% filter(lane == "A") %>% pull(sample_name)
+  b_names <- meta %>% filter(lane == "B") %>% pull(sample_name)
+  
+  merged_list <- list()
+  
+  for (i in seq_along(a_names)) {
+    a_nm      <- a_names[i]
+    b_nm      <- b_names[i]
+    
+    # Create the merged sample name by removing the "-A" suffix.
+    # e.g. "GSM4041151_healthy1_cd45-A" becomes "GSM4041151_healthy1_cd45-"
+    merged_nm <- str_replace(a_nm, "-A", "")
+    
+    # Seurat's merge() combines two or more Seurat objects into one.
+    # add.cell.ids prefixes every barcode with "laneA_" or "laneB_".
+    merged_list[[merged_nm]] <- merge(
+      x            = slist[[a_nm]],
+      y            = slist[[b_nm]],
+      add.cell.ids = c("laneA", "laneB")
+    )
+    cat("Merged:", a_nm, "+", b_nm, "->", merged_nm, "\n")
+  }
+  
+  split_names    <- c(a_names, b_names)
+  single_samples <- slist[!names(slist) %in% split_names]
+  
+  # c() on two lists concatenates them into one list
+  c(single_samples, merged_list)
+}
+
+seurat_list <- merge_ab_lanes(seurat_list, sample_meta)
+cat("\nTotal samples after merging:", length(seurat_list), "\n")
+```
+
+> **Question 4:** Why do we add `laneA_` and `laneB_` prefixes to the cell barcodes
+> when merging? What would happen if we did not?
+>
+> *Your answer:*
+
+---
+
+## 5. Quality Control
+
+QC in single-cell RNA-seq removes three types of low-quality observations:
+
+1. **Empty droplets** — droplets with no cell; contain only ambient RNA (very low gene count)
+2. **Damaged cells** — cells that lost cytoplasmic RNA during dissociation, leaving behind
+   mitochondrial RNA (very high % mitochondrial reads)
+3. **Doublets** — two cells in one droplet, inflating gene and UMI counts (Section 7)
+
+### 5.1 Computing QC Metrics
+
+We need three metrics per cell: `nFeature_RNA` and `nCount_RNA` are already present.
+We need to add `percent.mt`.
+
+Mitochondrial genes in the human genome are named with the prefix `MT-`. The function
+`PercentageFeatureSet()` calculates what percentage of a cell's total counts come from
+genes matching a given pattern. When a cell is damaged or dying, the outer membrane breaks
+down and cytoplasmic mRNA leaks out — but mitochondria (having their own membrane) are
+retained longer, so the proportion of mitochondrial reads increases.
+
+Note that the mitochondrial gene naming convention varies by species — in mouse it is
+`mt-` (lowercase). Always check for your organism.
+
+Use the PercentageFeatureSet to calculate statistics for mitochondrial gene expression
+across all the barcodes / cells. 
+
+```{r qc-metrics}
+# We use lapply() here for the same reason as before: it applies the same
+# operation to every sample without copy-pasting.
+# The anonymous function (function(so) { ... }) is a compact way to write
+# a function that is only used in one place.
+seurat_list <- lapply(seurat_list, function(so) {
+  
+  # PercentageFeatureSet() scans every gene name for the pattern "^MT-".
+  # The ^ is a regular expression anchor meaning "starts with" --
+  # so "^MT-" matches genes whose names begin with MT-, like MT-CO1, MT-ND1.
+  # Without the ^, it would also match genes that merely contain "MT-"
+  # anywhere in their name, which could cause false positives.
+  # The result is stored as a new column "percent.mt" in @meta.data.
+  # FILL IN CODE HERE
+  so$percent.mt <- PercentageFeatureSet(so, pattern = "^MT-")
+
+  
+  
+  
+  return(so)
+})
+
+# Confirm the new column appears in the metadata of the first sample
+head(seurat_list[[1]]@meta.data)
+```
+
+### 5.2 Visualising QC Metrics
+
+Always visualize distributions **before** filtering so you can make informed decisions.
+If you filter first, you cannot see what you removed.
+
+▶ **Provided** — merge samples temporarily for plotting.
+
+```{r pre-qc-merge}
+# We create a temporary merged object just so we can plot all samples together.
+# merge() here is Seurat's merge function (not base R's merge for data frames).
+# add.cell.ids prefixes each cell's barcode with its sample name, so barcodes
+# remain unique across samples.
+# This object is only for visualisation -- we continue working with the
+# per-sample list (seurat_list) for QC filtering.
+so_preqc <- merge(
+  x            = seurat_list[[1]],   # First seurat object
+  y            = seurat_list[-1],    # seurat_list[-1] means "all elements except the first" - so all other seurat objects
+  add.cell.ids = names(seurat_list)
+)
+```
+
+**Your turn** — use `VlnPlot()` to make violin plots of `nFeature_RNA`, `nCount_RNA`,
+and `percent.mt`, grouped by sample, in a single column (`ncol = 1`). Set `pt.size = 0`
+to hide individual points. Run `?VlnPlot` if you need help with the arguments.
+
+```{r qc-violin, fig.height=10}
+# Your code here
+VlnPlot(
+  so_preqc,
+  features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),
+  group.by = "sample",
+  ncol     = 1,
+  pt.size  = 0
+) & theme(axis.text.x = element_text(size = 6, angle = 45, hjust = 1))
+```
+
+▶ **Provided** — a scatter plot showing the relationship between UMI count and gene count.
+
+```{r qc-scatter}
+# FeatureScatter() plots two metadata variables against each other, one cell per point.
+# The strong positive correlation between nCount_RNA and nFeature_RNA is expected:
+# a cell with more total counts will generally detect more distinct genes.
+# Cells that deviate strongly from this trend are suspicious:
+#   - Bottom-right (high UMI, low genes): possibly empty droplets or dying cells
+#     where a few highly expressed transcripts dominate
+#   - Top-right (high UMI, high genes): possibly doublets
+FeatureScatter(
+  object   = so_preqc,
+  feature1 = "nCount_RNA",
+  feature2 = "nFeature_RNA",
+  group.by = "condition",
+  pt.size  = 0.3
+) +
+  labs(
+    title    = "nFeatures vs. nCounts",
+    subtitle = "Top-right = possible doublets | Bottom-left = possible empty droplets"
+  )
+```
+
+**Question 5:** Look at your violin plots. Do the distributions look similar across all
+samples? Note any samples that look notably different. What might explain a sample with
+a much higher median `percent.mt`?
+
+
+### 5.3 MAD-Based Adaptive Filtering
+
+A common pattern is applying the same hard cutoffs to every sample — e.g. removing all cells
+with `percent.mt > 20%`. The problem is that these thresholds are arbitrary and ignore real
+differences between samples. A sample with generally high mitochondrial content (perhaps due
+to tissue type or dissociation conditions) would be over-filtered.
+
+A better approach uses the **median absolute deviation (MAD)** to identify outliers relative
+to each sample's own distribution. The idea is simple:
+
+```{r mad-explainer}
+# Toy example: find the outlier in this set of values
+values <- c(500, 520, 480, 510, 495, 505, 490, 2400)
+
+# The median is robust to outliers -- it is not pulled toward the extreme value.
+# The MAD measures how spread out the typical values are, also robustly.
+cat("Median:", median(values), "\n")
+cat("MAD:   ", mad(values), "\n\n")
+
+# A value more than 3 MADs above the median is considered an "outlier".
+# This threshold adapts to each sample's own distribution rather than
+# using a fixed number that may be too strict or too lenient for a given sample.
+upper_limit <- median(values) + 3 * mad(values)
+cat("Upper limit (median + 3*MAD):", round(upper_limit), "\n")
+cat("Which values are flagged?", values > upper_limit, "\n")
+```
+
+The function `isOutlier()` from `scuttle` does this automatically, per sample, and on the
+log scale (better for count data that spans orders of magnitude).
+
+Complete the `nmads` argument and the `type` for the mitochondrial filter.
+Think carefully: should high mitochondrial percentage be caught by `"lower"` or `"higher"`?
+
+```{r qc-mad}
+# We write this as a function (rather than inline code) for two reasons:
+# 1. We need to run it on every sample -- wrapping it in a function means
+#    we can use lapply() cleanly
+# 2. It makes it easy to change nmads in one place and re-run everything
+filter_by_mad <- function(so, nmads) {
+  
+  # Seurat v5 stores data in "layers" which can be split across samples after merging.
+  # JoinLayers() consolidates them into a single layer, which is required before
+  # converting to a SingleCellExperiment object.
+  so  <- JoinLayers(so)
+  
+  # as.SingleCellExperiment() converts our Seurat object to a different but compatible
+  # format used by Bioconductor packages like scuttle. The QC metrics we need
+  # (nCount_RNA, nFeature_RNA, percent.mt) are carried over automatically.
+  sce <- as.SingleCellExperiment(so)
+  
+  # isOutlier() computes the MAD-based threshold and returns a logical vector:
+  # TRUE for cells that are outliers (to be flagged), FALSE for cells that pass.
+  #
+  # metric: the vector of values to test (one number per cell)
+  # nmads:  how many MADs from the median counts as "too extreme"
+  # type:   "lower" flags values that are unusually LOW
+  #         "higher" flags values that are unusually HIGH
+  # log:    TRUE means the test is done on log(metric), which is more appropriate
+  #         for count data that spans several orders of magnitude
+
+  # TODO: USE THIS FUNCTION MULTIPLE TIMES TO TEST VARIOUS QC METRICS FOR ANY OUTLIERS
+  
+    # nFeature_RNA: flag cells with unusually LOW gene counts (empty droplets)
+  #low_features  <- isOutlier(sce$nFeature_RNA,  nmads = nmads, type = "lower",  log = TRUE)
+  low_gene  <- isOutlier(sce$nFeature_RNA, nmads = nmads, type = "lower",  log = TRUE)
+
+  
+  # nCount_RNA: flag cells with unusually LOW UMI counts (empty droplets)
+  #low_counts    <- isOutlier(sce$nCount_RNA,    nmads = nmads, type = "lower",  log = TRUE)
+  low_lib   <- isOutlier(sce$nCount_RNA,   nmads = nmads, type = "lower",  log = TRUE)
+
+  
+  # percent.mt: flag cells with unusually HIGH mitochondrial % (damaged/dying cells)
+  #high_mt       <- isOutlier(sce$percent.mt,    nmads = nmads, type = "higher", log = FALSE)
+  high_mt   <- isOutlier(sce$percent.mt,   nmads = nmads, type = "higher", log = FALSE)
+
+  # log = FALSE for percent.mt because it can be 0, and log(0) = -Inf which breaks the calculation
+  
+  high_gene <- isOutlier(sce$nFeature_RNA, nmads = nmads, type = "higher", log = TRUE)
+
+
+  
+  # The | operator means OR: a cell is discarded if it fails ANY of the checks.
+  # A cell only needs to fail one metric to be considered low quality.
+  # TODO: CREATE A COLUMN THAT CHECKS IF ANY SINGLE METRIC FAILS
+  
+  # A cell is discarded if it fails ANY single metric
+  discard_flag <- low_lib | low_gene | high_gene | high_mt
+  
+  # We store each flag as a separate column in @meta.data.
+  # This lets us see exactly WHY each cell was flagged, not just that it was.
+  # This is useful for troubleshooting and for inspecting borderline samples.
+  # TODO: CREATE A NEW COLUMN THAT STORES THE RESULTS FOR EACH OF THE QC METRICS YOU CHOOSE
+
+  # Store each flag separately so we can see WHY a cell was flagged
+  so$qc_low_lib    <- low_lib
+  so$qc_low_gene   <- low_gene
+  so$qc_high_gene  <- high_gene
+  so$qc_high_mt    <- high_mt
+  so$qc_discard    <- discard_flag
+  
+  return(so)
+}
+
+# lapply() applies filter_by_mad() to every sample in seurat_list.
+# The result is a new list of Seurat objects, each with QC columns added.
+# We pass nmads as an extra argument -- lapply() forwards it to filter_by_mad().
+# Try nmads = 3 first, then revisit in Question 7.
+seurat_list <- lapply(
+  
+  seurat_list,
+  filter_by_mad,
+  nmads = 3
+  
+)
+
+```
+```{r}
+print(seurat_list)
+```
+
+
+▶ **Provided** — summarise how many cells are flagged per sample.
+
+```{r qc-summary}
+# Another lapply() pattern: extract a summary from each sample, then
+# bind_rows() stacks all the per-sample data frames into one table.
+
+# You'll notice we are simply calling the columns we created above
+qc_summary <- lapply(names(seurat_list), function(nm) {
+  md <- seurat_list[[nm]]@meta.data
+  data.frame(
+    sample        = nm,
+    total_cells   = nrow(md),
+    low_lib       = sum(md$qc_low_lib),
+    low_gene      = sum(md$qc_low_gene),
+    high_gene     = sum(md$qc_high_gene),
+    high_mt       = sum(md$qc_high_mt),
+    total_discard = sum(md$qc_discard),
+    pct_discard   = round(100 * mean(md$qc_discard), 1)
+  )
+}) %>% bind_rows()
+
+print(qc_summary)
+```
+
+▶ **Provided** — Visualise which cells are flagged.
+
+```{r qc-discard-plot}
+# Now that filter_by_mad() has added qc_discard to each sample's metadata,
+# we rebuild the merged object so those columns are already present.
+# This avoids the barcode alignment problems that arise from trying to transfer
+# flags from the per-sample list into a separately-created merged object.
+so_preqc <- merge(
+  x            = seurat_list[[1]],
+  y            = seurat_list[-1],
+  add.cell.ids = names(seurat_list)
+)
+
+# qc_discard is already in @meta.data -- no extra transfer step needed
+# You'll notice the group.by allows us to color by a variable we created in
+# the metadata
+FeatureScatter(
+  object   = so_preqc,
+  feature1 = "nCount_RNA",
+  feature2 = "percent.mt",
+  group.by = "qc_discard",
+  pt.size  = 0.3,
+  cols     = c("grey80", "firebrick")
+) +
+  labs(title  = "MAD-flagged cells",
+       colour = "Flagged for removal")
+```
+
+**Question 6:** Look at the `pct_discard` column. Are some samples losing more cells
+than others? At what percentage of cells discarded would you start to worry that something
+went wrong with the whole sample?
+
+
+
+**Question 7:** We used `nmads = 3`. Go back and re-run the filter with `nmads = 2`.
+How many more cells are removed? Now try `nmads = 5`. What is the trade-off you are making
+as you move the threshold in each direction? Is there a single correct value?
+
+
+### 5.4 Applying the Filter
+
+Remove the flagged cells. We want to keep cells where `qc_discard` is `FALSE`.
+
+```{r apply-qc}
+# subset() on a Seurat object works similarly to filtering rows in a data frame.
+# The subset argument is evaluated against @meta.data -- so qc_discard here
+# refers to the column we just added.
+# We use lapply() to apply this to every sample, again producing a new list
+# where each object contains only the cells that passed QC.
+
+# TODO: FIGURE OUT HOW TO USE THE SEURAT SUBSET TO REMOVE ANY CELLS WHERE qc_discard IS FALSE
+seurat_list <- lapply(seurat_list, function(so) {
+
+  
+})
+
+cells_after_qc <- sapply(seurat_list, ncol)
+cat("Cells remaining after QC:\n")
+print(cells_after_qc)
+cat("\nTotal:", sum(cells_after_qc), "\n")
+```
+
+---
+
+
+## 6. Doublet Detection
+
+A **doublet** is a droplet containing two cells. It appears as one "cell" with roughly
+twice the expected number of genes and UMIs. If not removed, doublets can form spurious
+clusters between cell types or inflate gene expression estimates.
+
+**Critical:** doublet detection must be run **per sample, before merging**. If you run
+it on the merged object, the algorithm sees cells from many different donors and cell types.
+High-expressing cells from one donor can look like doublets of lower-expressing cells from
+another, producing many false positives. Running it per sample ensures the algorithm only
+compares cells from the same library, where a genuinely high-count cell is more clearly
+anomalous.
+
+`scDblFinder()` takes a `SingleCellExperiment` object. The two output
+columns you need are `scDblFinder.score` (a continuous score) and `scDblFinder.class`
+(the call: `"singlet"` or `"doublet"`). Transfer them to the Seurat metadata.
+
+```{r doublets}
+seurat_list <- lapply(seurat_list, function(so) {
+  
+  # Convert to SingleCellExperiment -- scDblFinder requires this format.
+  # JoinLayers() is needed first in Seurat v5 for the same reason as in filter_by_mad().
+  so  <- JoinLayers(so)
+  sce <- as.SingleCellExperiment(so)
+  
+  # scDblFinder() simulates artificial doublets by combining random pairs of cells,
+  # then trains a classifier to distinguish real cells from these simulated doublets.
+  # It adds results directly to the SCE object's cell metadata.
+  sce <- scDblFinder(sce = sce)
+  
+  # Transfer results back to the Seurat metadata.
+  # scDblFinder.score: a continuous probability (0-1); higher = more likely a doublet
+  # scDblFinder.class: the binary call -- "singlet" or "doublet"
+  so$doublet_score <- sce$___   # <-- continuous score column
+  so$doublet_class <- sce$___   # <-- singlet/doublet call column
+  
+  return(so)
+})
+```
+
+▶ **Provided** — summarise doublet calls and visualise scores. This pattern of
+code should be familiar - lapply using an anonymous function which extracts
+data from each seurat object and binds it together into a single dataframe to
+summarize the entire dataset. 
+
+```{r doublet-summary}
+doublet_summary <- lapply(names(seurat_list), function(nm) {
+  so <- seurat_list[[nm]]
+  data.frame(
+    sample       = nm,
+    n_cells      = ncol(so),
+    n_doublets   = sum(so$doublet_class == "doublet"),
+    pct_doublets = round(100 * mean(so$doublet_class == "doublet"), 1)
+  )
+}) %>% bind_rows()
+
+print(doublet_summary)
+```
+
+```{r doublet-plot}
+# Merge for plotting only -- same pattern as the pre-QC merge above.
+# geom_hline() adds a horizontal reference line at 0.5.
+so_predbl <- merge(seurat_list[[1]], y = seurat_list[-1],
+                   add.cell.ids = names(seurat_list))
+
+VlnPlot(
+  object   = so_predbl,
+  features = "doublet_score",
+  group.by = "sample",
+  pt.size  = 0
+) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", colour = "firebrick") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 7)) +
+  labs(title    = "Doublet scores per sample",
+       subtitle = "Cells above the dashed line are called doublets")
+```
+
+**Question 9:** The expected doublet rate for 10X Genomics is ~0.8% per 1,000 cells
+loaded. Do the rates you observe match this expectation? What are the consequences of
+being too aggressive with doublet removal (i.e. a high false positive rate)?
+
+
+
+```{r remove-doublets}
+seurat_list <- lapply(seurat_list, function(so) {
+  subset(
+    x      = so,
+    subset = doublet_class == "singlet" 
+  )
+})
+
+cat("Cells after doublet removal:\n")
+print(sapply(seurat_list, ncol))
+```
+
+---
+
+## 8. Normalisation and Variable Feature Selection
+
+We need to normalise for differences in sequencing depth before comparing cells.
+A cell with 10,000 UMIs will appear to express every gene at twice the level of an
+otherwise identical cell with 5,000 UMIs — a purely technical difference.
+
+**Log normalisation:** divide each cell's counts by its total UMIs, multiply by 10,000,
+then take the natural log. This puts all cells on a comparable scale regardless of how
+deeply they were sequenced.
+
+We also select the **highly variable genes (HVGs)** — genes that vary most across cells.
+These are the most informative for distinguishing cell types and will be used in PCA.
+Genes that are expressed at the same level in every cell carry no information for
+clustering and are excluded to reduce noise and computation time.
+
+**Why do this per sample rather than on the merged object?** Normalising per sample
+ensures that each sample's own library size distribution is used as the reference.
+Identifying variable genes per sample and then taking the union (which Seurat does
+automatically at the merge step) avoids genes that are only "variable" because of
+technical differences between batches.
+
+Complete the normalisation and variable feature selection. The function
+names are `NormalizeData()` and `FindVariableFeatures()`. Run `?NormalizeData` if needed.
+
+```{r normalise}
+seurat_list <- lapply(seurat_list, function(so) {
+  
+  # NormalizeData() normalises the raw counts and stores the result in the
+  # "data" layer of the Seurat object (the "counts" layer is kept unchanged).
+  # normalization.method = "LogNormalize": divide by total counts, multiply by
+  #   scale.factor, then take log1p (log(x + 1), the +1 avoids log(0)).
+  # scale.factor = 10000: normalises to "counts per 10,000", often called CP10K.
+  #   This makes values interpretable across cells with different sequencing depths.
+  so <- NormalizeData(
+    object               = so,
+    normalization.method = "___",   # <-- 
+    scale.factor         = ___      # <-- 
+  )
+  
+  # FindVariableFeatures() identifies genes that vary more across cells than
+  # would be expected by chance given their mean expression level.
+  # selection.method = "vst": variance-stabilising transformation -- fits a curve
+  #   to the mean-variance relationship and selects genes above the curve.
+  # nfeatures: how many top variable genes to select.
+  so <- FindVariableFeatures(
+    object           = so,
+    selection.method = "vst",
+    nfeatures        = ___   # <-- 
+  )
+  
+  return(so)
+})
+
+# VariableFeatures() retrieves the list of selected HVGs from a Seurat object.
+top10 <- head(VariableFeatures(seurat_list[[1]]), 10)
+cat("Top 10 highly variable genes:\n")
+print(top10)
+```
+
+**Question 10:** Look at the top variable genes. Do any look like known immune cell
+markers? Does that make sense for the CD45+ fraction? Are there any genes you would
+not expect to see here?
+
+
+
+---
+
+## 9. Merging All Samples
+
+Now that each sample has been QC-filtered, doublet-removed, and normalised, we combine
+them into a single Seurat object for joint analysis.
+
+▶ **Provided** — merge all samples and verify the metadata.
+
+```{r merge-all}
+# merge() with multiple objects: the first goes in x, the rest go in y as a list.
+# add.cell.ids prefixes every barcode with the sample name to keep them unique.
+# merge.data = TRUE carries over the normalised data (the "data" layer) from
+# each sample, not just the raw counts. Without this, we would need to re-normalise
+# after merging.
+#
+# Note: after merging in Seurat v5, counts and data are stored as separate named
+# layers (e.g. "counts.sample1", "data.sample1"). We will join these with
+# JoinLayers() before ScaleData() below.
+so_merged <- merge(
+  x            = seurat_list[[1]],
+  y            = seurat_list[-1],
+  add.cell.ids = names(seurat_list),
+  merge.data   = TRUE
+)
+
+so_merged
+
+cat("\nTotal cells:", ncol(so_merged), "\n")
+cat("Total genes:", nrow(so_merged), "\n")
+```
+
+
+---
+
+## 10. Pre-processing Before Integration
+
+We scale the data and run PCA to reduce dimensionality before integration.
+
+**Scaling** transforms each gene to have mean 0 and variance 1 across all cells. This
+is necessary before PCA because PCA is sensitive to the scale of each variable —
+a highly expressed gene with large absolute values would dominate the PCA axes simply
+due to scale, not because it is biologically informative.
+
+**PCA** (principal component analysis) finds the linear combinations of genes that
+explain the most variation across cells. Instead of working with ~18,000 genes
+(most of which are noisy), we reduce the data to the top 50 principal components,
+which capture the major axes of biological variation much more efficiently.
+
+▶ **Provided** — join layers, scale, and run PCA.
+
+```{r scale-pca}
+# JoinLayers() consolidates the per-sample layers created by merge() into
+# single "counts" and "data" layers. This is required in Seurat v5 before
+# ScaleData() and most downstream steps.
+so_merged <- JoinLayers(so_merged)
+
+# ScaleData() centres and scales each gene across all cells.
+# features = rownames(so_merged) scales all genes, not just the HVGs.
+# Scaling all genes is slower but necessary if you want to visualise
+# non-HVG genes in heatmaps or feature plots later.
+so_merged <- ScaleData(
+  object   = so_merged,
+  features = rownames(so_merged)
+)
+
+# RunPCA() performs PCA on the scaled HVG expression matrix.
+# npcs = 50: compute the top 50 principal components.
+#   We will decide how many to actually use based on the elbow plot.
+# verbose = FALSE: suppress the per-PC output (too much text)
+so_merged <- RunPCA(
+  object  = so_merged,
+  npcs    = 50,
+  verbose = FALSE
+)
+```
+
+Produce an elbow plot using `ElbowPlot()`. This shows the standard
+deviation explained by each PC. Look for where the curve flattens — beyond that point,
+additional PCs capture mostly noise rather than real biological signal.
+
+```{r elbow}
+# Your code here
+
+```
+
+Set `n_pcs` based on your elbow plot.
+
+```{r set-npcs}
+# Based on the elbow plot, I will use this many PCs:
+n_pcs <- ___   # <-- your choice
+
+
+```
+
+### 10.1 Inspect Batch Structure Before Integration
+
+Before correcting for batch effects, we visualise the data in 2D using UMAP to understand
+what the dominant sources of variation are. If cells separate primarily by donor rather
+than by cell type or condition, integration is clearly needed.
+
+**UMAP** (Uniform Manifold Approximation and Projection) takes the high-dimensional PCA
+coordinates and projects them into two dimensions for visualisation. Cells that are similar
+in gene expression end up close together; dissimilar cells end up far apart.
+
+▶ **Provided** — build a cell neighbourhood graph and run UMAP on the unintegrated PCA.
+
+```{r umap-unintegrated}
+# FindNeighbors() builds a k-nearest neighbour graph in PCA space.
+# Each cell is connected to its most similar neighbours.
+# This graph is used by both FindClusters() (in Part 2) and RunUMAP() here.
+# dims = 1:n_pcs: use the first n_pcs principal components as the input space.
+so_merged <- FindNeighbors(
+  object    = so_merged,
+  dims      = 1:n_pcs,
+  reduction = "pca"
+)
+
+# RunUMAP() takes the neighbour graph and produces a 2D embedding.
+# reduction.name = "umap.unintegrated" saves this UMAP under a custom name
+# so we can compare it to the Harmony UMAP later without overwriting it.
+so_merged <- RunUMAP(
+  object         = so_merged,
+  dims           = 1:n_pcs,
+  reduction      = "pca",
+  reduction.name = "umap.unintegrated"
+)
+```
+
+Make three UMAP plots of the unintegrated data, colouring cells by
+`"donor"`, `"condition"`, and `"fraction"` respectively. Use `DimPlot()` with
+`reduction = "umap.unintegrated"`. Arrange them in a column using `/` from `patchwork`.
+
+```{r umap-unint-plots, fig.height=14}
+# Your code here
+
+```
+
+**Question 11:** Which variable — donor, condition, or fraction — most strongly
+separates cells in the unintegrated UMAP? Is this what you expected?
+
+Now think about what to do with this: which sources of variation should we **remove**
+(because they are technical batch effects) and which should we **preserve** (because
+they reflect real biology we want to study)?
+
+
+
+
+## 11. Decisions Log
+
+Fill in this table before moving to Part 2. There are no uniquely correct answers, but
+you should be able to justify every choice.
+
+| Step | Value used | Cells removed | Your reasoning |
+|------|-----------|---------------|----------------|
+| `min.cells` | | — | |
+| `min.features` | | — | |
+| `percent.mt` pattern | `^MT-` | — | Mitochondrial genes in humans |
+| MAD `nmads` threshold | | | |
+| Doublet removal | — | | |
+| HVGs selected | | — | |
+| Number of PCs | | — | |
+| **Total cells remaining** | | | |
+
+---
+
+## 12. Save for Part 2
+
+▶ **Provided** — save the cleaned, integrated object.
+
+```{r save}
+# saveRDS() saves a single R object to a file. readRDS() in Part 2 will
+# restore it exactly as it is now, including all reductions and metadata.
+saveRDS(object = so_merged, file = "liver_cirrhosis_part1.rds")
+
+cat("Saved: liver_cirrhosis_part1.rds\n")
+cat("Cells:", ncol(so_merged), "\n")
+cat("Genes:", nrow(so_merged), "\n")
+cat("Reductions:", paste(names(so_merged@reductions), collapse = ", "), "\n")
+```
+
+In Part 2 we will cluster these cells, identify cell types using known marker genes,
+and run pseudobulk differential expression analysis between healthy and cirrhotic liver.
+
+---
+
+## Session Info
+
+```{r session-info}
+sessionInfo()
+```

@@ -1,111 +1,158 @@
-# Quickly transferring your GitHub Repos
+# Single-Cell RNA-seq Workflow: BAM to Analysis with Scanpy and Seurat
 
-The easiest way to transfer your repos to your own organization is to clone it 
-and change the remote. 
+## Overview
+This project recreates a single-cell RNA-seq workflow characterizing the postnatal day 7 mouse hippocampus. It covers:
 
-```bash
-git clone git@github.com:bf528/your-repo.git
-cd your-repo/
-```
+1. Pre-processing raw sequencing data (BAM → FASTQ → counts matrix)  
+2. Downstream analysis and visualization using **Scanpy**  
 
-In between this step, go to GitHub and create a new repository under your own 
-username. In the command below, replace the SSH link with the SSH link on the
-page shown when you create your new repo, and then run the commands. 
+The workflow integrates **Nextflow** for pipeline automation and **Python/Scanpy** for data analysis.
 
+**Relevant publications:**  
+- [Nature Communications: Isoform characterization in mouse hippocampus](https://www.nature.com/articles/s41467-020-20343-5#Abs1)  
+- [PMC Article for Scanpy Example](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC7815907/)
 
-```bash
-git remote set-url origin git@github.com:<your_github_username>/your_new_repo.git
-git push -u origin main
-```
+## Part 1: Pre-processing (BAM → FASTQ → Counts Matrix)
 
-Note that this method will **preserve** your commit history. If you want to reset
-your history, you will need to use a different method (or you can delete the .git/
-folder and follow the steps provided when you create a new repo on the GitHub website)
+### Objectives
+- Download raw BAM files using GEO accession or EMBL-ENA  
+- Convert BAM to FASTQ  
+- Run **Cell Ranger count** to generate the counts matrix  
 
+### Requirements
+- Nextflow  
+- Container: `ghcr.io/bf528/cellranger:latest`  
+- Samplesheet with file names and FTP links for BAM files  
 
-# Single Cell RNAseq pre-processing
+### Workflow Steps
+1. **Download the data:**  
+   - Use GEO accession/EMBL-ENA to locate BAM files  
+   - Create a Nextflow channel that reads sample names and download links  
+   - Use `wget` or another utility to download the files  
+2. **Convert BAM → FASTQ:**  
+   - Use the `bamtofastq` utility within the Cell Ranger container  
+   - Multi-threading can accelerate the process  
+3. **Run Cell Ranger Count:**  
+   - Execute the `cellranger count` pipeline on the FASTQ files  
+   - Reference genome (pre-downloaded): `/projectnb/bf528/materials/single_cell/refs/`  
+   - Adjust resources per module as needed  
+4. **Re-run pipeline for full dataset:**  
+   - Update samplesheet to the full dataset links  
+   - Run the pipeline with appropriate CPU and memory allocation  
 
-We are going to recreate some of the basic findings from this paper: https://www.nature.com/articles/s41467-020-20343-5#Abs1
-The authors were attempting to characterize how isoform expression changes across cell types and spatial resolution. We will
-focus primarily on recreating the results of their single cell experiment characterizing the mouse hippocampus at postnatal
-day 7.
+### Nextflow Requirements
+- `main.nf` script  
+- `modules/` directory  
+- `nextflow.config`  
 
-I will describe the steps you should follow but leave the specifics to you. Hopefully this will get you some practice with
-where you would start when constructing your own workflow.
+## Part 2A: Analysis with Scanpy
 
-With 10X single cell RNAseq, many studies store the raw data in the form of the aligned BAM files. In order to regenerate a 
-counts matrix, you will first need to convert the BAM to a FASTQ and run the Cellranger count pipeline. 
+### Setup
+1. Create a Conda environment with required packages (`environment.yml`):
+   ```yaml
+   name: scRNAseq
+   dependencies:
+     - scanpy=1.11.1
+     - ipykernel=6.29.5
 
-## Objectives
+## Citations:
 
-- Use the GEO accession and EMBL-ENA to figure out where to download the apprporiate data
-- Construct a small nextflow pipeline that will download the BAM files using wget, 
-convert them to FASTQ, and run cellranger count
+Isaac Virshup, Sergei Rybakov, Fabian J. Theis, Philipp Angerer, F. Alexander Wolf. anndata: Annotated data, JOSS 2024 Sep 16. doi: 10.21105/joss.04371
 
-## Clone the github classroom link 
+Wolf, F., Angerer, P. & Theis, F. SCANPY: large-scale single-cell gene expression data analysis, Genome Biol 19, 15 (2018). https://doi.org/10.1186/s13059-017-1382-0
 
-You'll notice that it's empty, you'll need to create this workflow mostly on your own. 
+### Paper reference:
 
-The minimal set of requirements that you need for a nextflow workflow are:
+Joglekar A, Prjibelski A, Mahfouz A, et al. A spatially resolved brain region- and cell type-specific isoform atlas of the postnatal mouse brain. Nat Commun. 2021;12(1):463. Published 2021 Jan 19. doi:10.1038/s41467-020-20343-5
 
-1. A `main.nf` script
-2. A modules directory
-3. A nextflow.config
+## Part 2B: Analysis with Seurat
 
-## Downloading the data
+### Analysis Framework
 
-Look in the paper for the GEO accession and search for it on EMBL-ENA. This will bring you to a page that describes
-the samples in the experiment. **You may start by using the provided samplesheet, which has FTP links to small subsetted
-versions of the files. Once you've gotten the channel and module, you can switch to your samplesheet with the real files.**
+Downstream analysis is performed in R using the following ecosystem:
 
-- Locate the FTP links for how to download the BAM files and encode this information in a samplesheet
-- Create a channel that reads in the the name and link to the files
-- Create a process that uses `wget` or another utility to download the files
+SingleCellExperiment – core data structure
 
-## Generate a module for converting the BAMs to FASTQs
+muscat – pseudobulk aggregation by cell type and sample
 
-Container for Cellranger:
+DESeq2 – differential expression on pseudobulked counts
 
-`ghcr.io/bf528/cellranger:latest`
+Seurat – quality control, dimensionality reduction, clustering, and visualization
 
-BAM files containing certain tags (CB, CR, UR, etc.) are able to be properly re-converted back to their original
-representation as FASTQ files.
+This hybrid approach combines robust differential expression testing with standard single-cell visualization and clustering workflows.
 
-- Use the bamtofastq utility to convert the BAM files to FASTQs
-- Using more threads will significantly increase the speed
+### Environment Setup
+Software Requirements:
 
+R (≥ 4.2)
 
-## Run the Cellranger count pipeline
+RStudio (optional)
 
-- Generate a command that will successfully run the cellranger count
-pipeline on the two samples. You may find the reference genome pre-downloaded
-here: /projectnb/bf528/materials/single_cell/refs/
+R Packages
 
-## Re-run the pipeline for the full data
+Seurat
 
-Switch your samplesheet to the one you generated with the actual links to the
-data. Now re-run your pipeline on the full samples. Make sure you give each
-module an appropriate amount of resources (cellranger count is a very intensive
-process).
+SingleCellExperiment
 
-## Create your own docker container and push it to the GitHub Container Registry
+muscat
 
-With any remaining time, please try to generate your own container for CellRanger.
-You may find **one** method for creating a CellRanger container here: 
-https://github.com/BF528/pipeline_containers
+DESeq2
 
-You may also find these instructions helpful for [building a container](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry#building-container-images)
+tidyverse
 
-Once you've successfully created the container in Docker Desktop on your local
-machine. You will need to push it to the container registry. 
+## Dataset
 
-Please follow the directions in this order:
+The downstream analysis uses the publicly available interferon-β stimulation PBMC dataset from Kang et al. (2018), accessed via the muscData package. This dataset contains annotated immune cell types across multiple individuals and conditions, making it well suited for pseudobulk and clustering analyses.
 
-[Authenticating to the registry](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry#authenticating-to-the-container-registry)
+## Analysis Overview
 
-[Tagging your container image](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry#tagging-container-images)
+The analysis implemented in this repository includes:
 
-[Pushing your image to the registry](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry#pushing-container-images)
+Exploration of SingleCellExperiment objects
 
-After you've done this successfully, try switching your pipeline to use your container
-image instead of the pre-provided one. 
+Inspection of cell-level and gene-level metadata
+
+Subsetting by cell type, individual, and condition
+
+Quality control metrics (library size, detected genes, mitochondrial content)
+
+Pseudobulk aggregation by cell type and sample
+
+Differential expression analysis using DESeq2
+
+Seurat-based normalization, clustering, and UMAP visualization
+
+Marker gene identification and heatmap visualization
+
+## Outputs
+
+The analysis produces:
+
+QC summaries for cells and genes
+
+Pseudobulk count matrices per cell population
+
+Differential expression results for stimulated vs control conditions
+
+Clustered Seurat objects
+
+UMAP plots colored by condition and cluster
+
+Marker gene tables and heatmaps
+
+Reproducibility
+
+Pre-processing is fully automated via Nextflow
+
+Analysis steps are documented and executable via R Markdown
+
+Public datasets and containerized tools ensure reproducibility across environments
+
+## Citations:
+
+Satija R et al. Spatial reconstruction of single-cell gene expression data. Nature Biotechnology (2015)
+
+Hao Y et al. Integrated analysis of multimodal single-cell data. Cell (2021)
+
+### Paper reference:
+Kang HM et al. Multiplexed droplet single-cell RNA-sequencing using natural genetic variation. Nature Biotechnology (2018)

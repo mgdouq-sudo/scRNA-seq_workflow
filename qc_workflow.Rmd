@@ -1,0 +1,312 @@
+---
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## Installation and Setup
+
+```{r}
+#BiocManager::install("muscData")
+#BiocManager::install("muscat")
+
+```
+
+```{r}
+library(muscData)
+library(Seurat)
+library(muscat)
+library(tidyverse)
+
+sce <- Kang18_8vs8()
+```
+
+---
+
+## Single Cell Experiment
+
+Single cell experiment objects are the R equivalent of an anndata object and store all of the data for a single cell experiment in a single data structure.
+
+This will return the basic dimensions of the dataset in the form of genes x cells:
+
+```{r}
+dim(sce)
+```
+
+---
+
+## Three main components of the object
+
+1. **Assays** (count matrices)
+2. **colData** (cell-level metadata)
+3. **rowData** (gene-level metadata)
+
+```{r}
+
+counts(sce)
+```
+
+```{r}
+
+head(colData(sce))
+```
+
+```{r}
+
+head(rowData(sce))
+```
+
+---
+
+## Exploring Cell Metadata
+
+```{r}
+colData(sce)
+```
+
+The `ind` column contains the ID of each individual sample. How many unique samples are there?
+
+```{r}
+length(unique(colData(sce)$ind))
+
+```
+
+The `stim` column indicates whether cells were stimulated with interferon-β or left as controls. How many cells are in each condition?
+
+```{r}
+table(sce$stim)
+
+```
+
+Create a cross-tabulation showing the number of cells for each individual in each condition:
+
+```{r}
+table(Individual = sce$ind, Condition = sce$stim)
+
+```
+
+The `cell` column contains cell type annotations. Which cell type has the most cells?
+
+```{r}
+cell_counts <- table(sce$cell)
+sort(cell_counts, decreasing = TRUE)
+
+```
+
+---
+
+## Exploring Gene Metadata
+
+```{r}
+head(rowData(sce))
+```
+
+The gene metadata contains Ensembl IDs and gene symbols. Find the gene symbol for "ENSG00000087086":
+
+```{r}
+rowData(sce)[rowData(sce)$ENSEMBL == "ENSG00000087086", ]
+
+```
+
+How many genes have the symbol "ISG15"?
+
+```{r}
+sum(rowData(sce)$SYMBOL == "ISG15")
+
+```
+
+---
+
+## Subsetting SingleCellExperiment Objects
+
+SCE objects use `sce[genes, cells]` syntax for subsetting.
+
+```{r}
+#!is.na(sce$cell) & sce$cell == "B cells"
+sce_bcells <- sce[, !is.na(sce$cell) & sce$cell == "B cells"]
+dim(sce_bcells)
+```
+
+```{r}
+
+sce_bcells_stim <- sce_bcells[, !is.na(sce_bcells$stim) & sce_bcells$stim == "stim"]
+dim(sce_bcells_stim)
+```
+
+Create a subset containing only CD14+ Monocytes from individual "101":
+
+```{r}
+
+
+mono_filter <- !is.na(sce$cell) & sce$cell == "CD14+ Monocytes" & 
+               !is.na(sce$ind) & sce$ind == "101"
+
+sce_mono_101 <- sce[, mono_filter]
+dim(sce_mono_101)
+
+```
+
+Create a subset containing cells from individuals "101" and "107", and only genes that start with "ISG":
+
+```{r}
+
+cell_filter <- !is.na(sce$ind) & sce$ind %in% c("101", "107")
+gene_filter <- !is.na(rowData(sce)$SYMBOL) & grepl("^ISG", rowData(sce)$SYMBOL)
+
+
+sce_subset <- sce[gene_filter, cell_filter]
+dim(sce_subset)
+
+
+```
+
+---
+
+## Quality Control Metrics
+
+```{r}
+
+lib_sizes <- colSums(counts(sce))
+summary(lib_sizes)
+```
+
+```{r}
+
+n_genes <- colSums(counts(sce) > 0)
+summary(n_genes)
+```
+
+```{r}
+
+sce$lib_size <- lib_sizes
+sce$n_genes <- n_genes
+colData(sce)
+```
+
+
+## Preparing for Pseudobulk Analysis
+
+For pseudobulk analysis, we aggregate cells by individual and condition.
+
+```{r}
+
+sce$sample_id <- paste(sce$ind, sce$stim, sep = "_")
+
+
+```
+
+```{r}
+
+table(sce$sample_id)
+```
+
+For CD14+ Monocytes, how many cells contribute to each pseudobulk sample?
+
+```{r}
+sce_mono <- sce[, !is.na(sce$cell) & sce$cell == "CD14+ Monocytes"]
+cells_per_sample <- table(sce_mono$sample_id)
+cells_per_sample
+```
+
+
+Use the aggregateData function from muscat to generate matrices where you've added
+up the counts from each cell population to a single count per sample. Pseudobulking
+has been shown to mitigate many of the biases when trying to compare expression 
+profiles of individual cells of the same type against individual cells. 
+
+You will want to use the `cell` and `sample_id` column to group and count cells
+```{r}
+BiocManager::install("muscat")
+library(muscat)
+pb <- aggregateData(sce,
+    assay = "counts", fun = "sum",
+    by = c("cell", "sample_id"))
+```
+  
+ 
+Choose just one of the cell populations at random, and extract out the counts
+using assay(sce_object, "name_in_column")
+```{r}
+
+b.cells.cts <- assay(pb, "B cells")
+
+```
+ 
+ 
+```{r}
+coldata <- data.frame(condition = colnames(b.cells.cts) %>% str_split_i("_", 2))
+rownames(coldata) <- colnames(b.cells.cts)
+coldata
+```
+ 
+```{r}
+library(DESeq2)
+dds <- DESeqDataSetFromMatrix(countData = b.cells.cts,
+                              colData = coldata,
+                              design = ~ condition)
+
+
+```
+
+
+```{r}
+dds <- DESeq(dds)
+res <- results(dds)
+resOrdered <- res[order(res$pvalue),]
+```
+
+```{r}
+resOrdered %>% as_tibble(rownames='id')
+```
+
+```{r}
+plotCounts(dds, gene="ISG15", intgroup="condition")
+```
+ 
+```{r}
+seurat <- CreateSeuratObject(counts = counts(sce), meta.data = as.data.frame(colData(sce)))
+
+```
+
+```{r}
+seurat[["percent.mt"]] <- PercentageFeatureSet(seurat, pattern = "^Mt")
+VlnPlot(seurat, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+```
+
+```{r}
+seurat <- NormalizeData(seurat)
+seurat <- FindVariableFeatures(seurat, selection.method = "vst", nfeatures = 2000)
+
+all.genes <- rownames(seurat)
+seurat <- ScaleData(seurat, features = all.genes)
+
+seurat <- RunPCA(seurat, features = VariableFeatures(object = seurat))
+ElbowPlot(seurat)
+```
+
+```{r}
+seurat <- FindNeighbors(seurat, dims = 1:20)
+seurat <- FindClusters(seurat, resolution = 0.5)
+seurat <- RunUMAP(seurat, dims = 1:20)
+DimPlot(seurat, reduction = "umap")
+```
+
+```{r, fig.width=16, fig.height=8}
+DimPlot(seurat, reduction = "umap", group.by=c('stim', 'seurat_clusters'), label=T)
+```
+
+
+```{r}
+seurat.markers <- FindAllMarkers(seurat)
+```
+
+```{r, fig.height=10, fig.width=10}
+seurat.markers %>%
+    group_by(cluster) %>%
+    dplyr::filter(avg_log2FC > 1) %>%
+    slice_head(n = 5) %>%
+    ungroup() -> top10
+DoHeatmap(seurat, features = top10$gene) + NoLegend()
+```

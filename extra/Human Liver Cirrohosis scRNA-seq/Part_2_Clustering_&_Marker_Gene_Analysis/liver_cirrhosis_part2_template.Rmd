@@ -1,0 +1,520 @@
+---
+title: "Human Liver Cirrhosis scRNA-seq — Part 2: Clustering & Marker Gene Analysis"
+subtitle: "Ramachandran et al. 2019 | GSE136103"
+author: ""
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 10,
+  fig.height = 6
+)
+```
+
+---
+
+## Learning Objectives
+
+By the end of this exercise you will be able to:
+
+1. Run the full Seurat clustering pipeline — variable features, scaling, PCA, UMAP, graph, clusters — within each fraction
+2. Use `clustree` to choose a clustering resolution and aid in justifying the choice
+3. Run `FindAllMarkers()` and interpret the key output columns
+4. Localise the TREM2+CD9+ macrophage subpopulation described in the paper
+5. Annotate clusters in both fractions using canonical marker genes
+
+**Estimated time:** 1-2 hours
+
+---
+
+## Background
+
+Ramachandran et al. sorted each liver biopsy into two fractions:
+
+- **CD45+** — haematopoietic cells: macrophages, Kupffer cells, T cells, NK cells,
+  B cells, monocytes
+- **CD45−** — non-haematopoietic cells: hepatocytes, cholangiocytes, endothelial
+  cells, hepatic stellate cells
+
+The authors clustered each fraction **separately** using standard Seurat PCA-based
+clustering, with resolutions tuned to the complexity of each compartment. We replicate
+that approach here.
+
+For each fraction we run a fresh pipeline from scratch: variable
+feature selection → scaling → PCA → UMAP → neighbour graph → clustering. The PCA
+embeddings are used consistently throughout.
+
+
+## 0. Libraries
+
+▶ **Provided**
+
+```{r libraries}
+library(Seurat)
+library(tidyverse)
+library(patchwork)
+library(clustree)
+
+set.seed(42)
+```
+
+---
+
+
+```{r split-fractions}
+
+# the data can be found at /projectnb/bf530/materials/cd45+_liver_cirrhosis.rds
+
+so_pos <- readRDS('/projectnb/bf530/materials/cd45+_liver_cirrhosis.rds')
+
+so_pos
+
+# An object of class Seurat 
+# 23043 features across 32626 samples within 1 assay 
+#Active assay: RNA (23043 features, 2000 variable features)
+# 21 layers present: counts.1, counts.2, counts.4, counts.5, counts.7, counts.8, counts.9, counts.11, counts.13, counts.14, data.1, data.2, data.4, data.5, data.7, #data.8, data.9, data.11, data.13, data.14, scale.data
+# 2 dimensional reductions calculated: pca, umap.unintegrated
+```
+
+
+```{r}
+# In Seurat v5, subsetting can leave data split across named layers.
+# JoinLayers() merges them back into single "counts" and "data" layers,
+# which is required before FindVariableFeatures() and ScaleData().
+so_pos <- JoinLayers(so_pos)
+
+so_pos
+
+# An object of class Seurat 
+# 23043 features across 32626 samples within 1 assay 
+# Active assay: RNA (23043 features, 2000 variable features)
+# 3 layers present: data, counts, scale.data
+# 2 dimensional reductions calculated: pca, umap.unintegrated
+```
+
+
+---
+
+## 2. Full Pre-processing Pipeline Per Fraction
+
+We run the complete pipeline independently within each fraction. Working per-fraction
+ensures that the highly variable genes, the PCA axes, and the UMAP layout all reflect
+variation *within* the cd45+ cells. 
+
+*Provided** — a single function encapsulates the whole pipeline so the same steps
+are applied consistently.
+
+```{r pipeline-fn}
+# run_pipeline() applies the full Seurat pre-processing and clustering-preparation
+# steps to one fraction object:
+#
+#   FindVariableFeatures  — identify the most informative genes for this fraction
+#   ScaleData             — center and scale for PCA
+#   RunPCA                — reduce to top n_pcs principal components
+#   RunUMAP               — 2-D layout for visualisation (stored as umap_name)
+#   FindNeighbors         — build KNN graph on PCA embeddings
+#
+# FindClusters() is called separately in Section 3 so the resolution sweep
+# can be done without re-running the expensive steps above.
+
+run_pipeline <- function(so, n_hvg = 2000, n_pcs = 30,
+                         umap_name = "umap") {
+  so <- FindVariableFeatures(so, nfeatures = n_hvg,      verbose = FALSE)
+  so <- ScaleData(so,          features = rownames(so),  verbose = FALSE)
+  so <- RunPCA(so,             npcs     = n_pcs,         verbose = FALSE)
+  so <- RunUMAP(so,
+                dims           = 1:n_pcs,
+                reduction      = "pca",
+                reduction.name = umap_name,
+                verbose        = FALSE)
+  so <- FindNeighbors(so,
+                      dims      = 1:n_pcs,
+                      reduction = "pca",
+                      verbose   = FALSE)
+  return(so)
+}
+```
+
+Inspect the elbow plots first to choose `n_pcs` for each fraction,
+then run the full pipeline.
+
+```{r elbow-plots, fig.height=4}
+# Run PCA with 50 PCs temporarily to see the full elbow curve.
+# We only need ScaleData and RunPCA for this — the rest of the pipeline
+# will be run properly below once you have chosen n_pcs.
+
+so_pos_tmp <- so_pos %>%
+  FindVariableFeatures(nfeatures = 2000, verbose = FALSE) %>%
+  ScaleData(features = rownames(so_pos), verbose = FALSE) %>%
+  RunPCA(npcs = 50, verbose = FALSE)
+
+
+
+ElbowPlot(so_pos_tmp, ndims = 50) + ggtitle("CD45+ elbow")
+```
+
+```{r run-pipeline}
+# Set n_pcs based on the elbow plots above.
+# n_pcs controls variable feature selection, scaling, PCA, UMAP, AND the
+# neighbour graph — it is the single parameter that flows through the whole pipeline.
+n_pcs_pos <-  20 # <-- your choice for CD45+
+
+
+so_pos <- run_pipeline(so_pos, n_pcs = n_pcs_pos, umap_name = "umap_pos")
+
+```
+
+
+---
+
+## 3. Resolution Sweep and clustree
+
+`FindClusters()` takes the KNN graph built by `FindNeighbors()` and finds communities
+within it using the Louvain algorithm. The `resolution` parameter controls granularity:
+higher values produce more clusters. We test a range, store all results in `@meta.data`,
+and use `clustree` to choose.
+
+### 3.1 CD45+ Resolution Sweep
+
+Complete the `resolution` argument in the loop.
+
+```{r res-sweep-pos}
+resolutions_pos <- c(0.1, 0.2, 0.3, 0.4, 0.5, 0.8, 1.0)
+
+for (res in resolutions_pos) {
+  so_pos <- FindClusters(
+    object     = so_pos,
+    resolution = res,
+    verbose = FALSE
+                        # Add in the parameters in your loop for resolution
+  )
+
+cat ("CD45+ | res", res, "->",
+  length(unique(so_pos@meta.data[[paste0("RNA_snn_res.", res)]])),
+  "clusters\n")
+}
+```
+
+```{r clustree-pos, fig.height=9, fig.width=8}
+# Each column = one resolution. Node size = cell count.
+# Edges show where cells move as resolution increases.
+# Look for: stable nodes that persist without gaining cells from many parents
+# (robust populations), and the resolution at which a small new cluster first
+# separates cleanly from a larger macrophage node (likely the TREM2+ population).
+
+# so_pos@meta.data will show you the cluster assignments for each resolution
+# Each separate resolution is a new column added with the cluster assignments
+
+clustree(so_pos, prefix = "RNA_snn_res.") # This is the prefix of the column
+```
+
+```{r}
+so_pos@meta.data
+```
+
+
+Generate two clustree plots now highlighting the expression of the TREM2 and CD9
+genes - the markers of the scar associated macrophages identified by the paper.
+
+```{r}
+clustree(so_pos, prefix = "RNA_snn_res.", node_colour = "TREM2",
+         node_colour_aggr = "mean", exprs = "data")
+
+clustree(so_pos, prefix = "RNA_snn_res.", node_colour = "CD9",   
+         node_colour_aggr = "mean", exprs = "data")
+```
+
+
+```{r choose-res-pos}
+chosen_res_pos  <-  0.1             # Choose a resolution based on the clustree results
+cluster_col_pos <- paste0("RNA_snn_res.", chosen_res_pos)
+Idents(so_pos)  <- cluster_col_pos
+
+```
+
+Note:
+
+When no reference annotation is available, Clustree interpretation becomes centered
+around stability: run FindClusters across a range of resolutions 
+(typically 0.1 to 1.5 in steps of 0.1) and treat the tree as a map of where the 
+data wants to split. A resolution is a reasonable choice if its nodes each have 
+a single dominant parent — meaning cells are flowing cleanly from one cluster 
+into two daughter clusters as resolution increases, rather than being pulled from
+multiple sources simultaneously. Multiple incoming arrows to a node signal 
+instability: the algorithm is forcing a split that the underlying data does not
+strongly support. The practical rule is to choose the lowest resolution at which
+biologically interpretable structure first appears, defined here not by marker 
+gene identity but by internal coherence — stable nodes, clean splits, and cluster
+sizes large enough to be meaningful given your total cell count. 
+
+
+If you have known reference cell types that you expect to find, you can also
+overlay their expression information onto the clustree plot to help you visualize
+at what resolution does the marker become stable in a cluster or various clusters. 
+
+---
+
+## 4. UMAPs at Chosen Resolutions
+
+Create three UMAP plots using `reduction = "umap_pos"` and use `group.by` to overlay
+the `condition`, your chosen resolution (RNA_snn_res.X.X), and the `sample` information.
+
+
+```{r umap-pos, fig.height=5}
+# CD45+ 
+# Your code here
+DimPlot(so_pos, reduction = "umap_pos", group.by = "condition")
+DimPlot(so_pos, reduction = "umap_pos", group.by = "RNA_snn_res.0.1")
+DimPlot(so_pos, reduction = "umap_pos", group.by = "sample")
+```
+
+Do cluster boundaries align with condition (healthy vs cirrhotic)?
+What would it mean biologically if a cluster were almost exclusively from one
+condition? Compare what you see here with the unintegrated UMAP from Part 1 —
+are donor effects visible within either fraction?
+
+
+---
+
+## 5. TREM2 and CD9 in the CD45+ Fraction
+
+The TREM2+CD9+ population is in the CD45+ fraction. Visualise these genes directly
+before running the formal marker analysis.
+
+### 5.1 Feature Plots
+
+Create a `FeaturePlot()` for `TREM2` and `CD9`.
+`reduction = "umap_pos"`, `ncol = 2`, `order = TRUE`.
+
+```{r featureplot-trem2-cd9, fig.height=5}
+# Your code here
+
+```
+
+### 5.2 Violin Plots Across CD45+ Clusters
+
+Create a `VlnPlot()` for `TREM2` and `CD9`. `pt.size = 0`, `ncol = 1`.
+
+```{r vlnplot-trem2-cd9, fig.height=8}
+# Your code here
+
+```
+
+---
+
+## 6. Marker Gene Analysis
+
+### 6.1 CD45+ Markers
+
+*Provided** — Allow several minutes. Most marker gene analyses use a simple
+wilcoxon rank sum test comparing the expression in every individual cluster vs.
+the expression of all other clusters. The p-values from these tests are often
+inflated but for the purposes of marker gene analysis, they are often reliable
+enough.
+
+```{r markers-pos}
+markers_pos <- FindAllMarkers(
+  object          = so_pos,
+  only.pos        = TRUE,
+  min.pct         = 0.25,
+  logfc.threshold = 0.25,
+  verbose         = TRUE
+)
+
+write.csv(markers_pos, "markers_cd45pos.csv", row.names = FALSE)
+cat("CD45+ marker rows:", nrow(markers_pos), "\n")
+head(markers_pos)
+```
+
+
+Key columns:
+
+| Column | Meaning |
+|--------|---------|
+| `avg_log2FC` | Log2 fold-change of the cluster vs all other cells |
+| `pct.1` | Fraction of cells *in* the cluster expressing the gene |
+| `pct.2` | Fraction of cells *outside* the cluster expressing the gene |
+| `p_val_adj` | BH-adjusted p-value |
+| `cluster` | Which cluster this row describes |
+
+
+### 6.2 Top Markers Per Cluster
+
+Extract out the top 5 markers by `avg_log2FC` per cluster, filtered to
+`p_val_adj < 0.05`.
+
+```{r top-markers}
+top5_pos <- markers_pos %>%
+  filter() %>%
+  group_by() %>%
+  slice_max(order_by = , n = 5) %>%
+  ungroup()
+
+```
+
+### 6.3 Marker Heatmaps
+
+Use `DoHeatmap()` for each fraction using the genes in `top5_pos` /
+`top5_neg`.
+
+```{r heatmap-pos, fig.height=10, fig.width=12}
+# CD45+ heatmap
+# Hint: pass top5_pos$gene to the features argument
+# Add + theme(axis.text.y = element_text(size = 7)) if labels overlap
+# Your code here
+
+```
+
+---
+
+## 7. Deep Dive: The TREM2+CD9+ Macrophage Cluster
+
+### 7.1 Markers of the Candidate Cluster
+
+Fill in the cluster number from earlier that represents the
+putative TREM2 - CD9 Macrophage cluster
+
+```{r trem2-cluster-markers}
+candidate_cluster <- "___"   # <-- from earlier
+
+trem2_cluster_markers <- markers_pos %>%
+  filter(cluster == candidate_cluster, p_val_adj < 0.05) %>%
+  arrange(desc(avg_log2FC))
+
+head(trem2_cluster_markers, 20)
+```
+
+Beyond `TREM2` and `CD9`, what are the top markers for this cluster?
+Ramachandran et al. report `GPNMB`, `LGMN`, and `SPP1` as additional markers,
+are they present in your list? Look up any genes you do not recognize.
+
+
+### 7.2 Dot Plot of Canonical TREM2+ Markers
+
+Use `DotPlot()` on `so_pos` for the panel below. Add `+ coord_flip()`.
+
+```{r dotplot-trem2, fig.height=7}
+trem2_panel <- c(
+  "TREM2", "CD9",
+  "GPNMB", "LGMN", "SPP1",
+  "C1QA", "C1QB",
+  "MARCO", "CD163",
+  "FCGR3A",
+  "CD14", "S100A8"
+)
+
+# Your code here
+
+```
+
+### 7.3 Condition Enrichment
+
+Calculate and plot the proportion of each CD45+ cluster made up of
+cirrhotic vs healthy cells as a stacked bar chart.
+
+```{r condition-proportions, fig.height=5}
+
+
+```
+
+Is the candidate cluster enriched in cirrhotic samples? Is this
+consistent with the paper's finding? State one caveat about interpreting cell
+proportions from samples that may differ in cell yield or sequencing depth.
+
+
+---
+
+## 8. Cell Type Annotation
+
+### 8.1 CD45+ Annotation
+
+| Cell type | Canonical markers |
+|-----------|-------------------|
+| Kupffer cells | `C1QA`, `C1QB`, `MARCO`, `CD163` |
+| TREM2+ macrophages | `TREM2`, `CD9`, `GPNMB`, `SPP1` |
+| Classical monocytes | `CD14`, `FCGR3A`, `S100A8`, `S100A9` |
+| CD8 T cells | `CD3D`, `CD8A`, `GZMB` |
+| CD4 T cells | `CD3D`, `CD4`, `IL7R` |
+| NK cells | `GNLY`, `NKG7`, `KLRD1` |
+| B cells | `CD19`, `MS4A1`, `CD79A` |
+| Plasma cells | `IGHG1`, `MZB1`, `SDC1` |
+
+Edit `annotation_map_pos` to match your cluster count.
+
+```{r annotate-pos}
+annotation_map_pos <- c(
+  "0" = "Unknown",
+  "1" = "Unknown",
+  "2" = "Unknown",
+  "3" = "Unknown",
+  "4" = "Unknown",
+  "5" = "Unknown",
+  "6" = "Unknown",
+  "7" = "Unknown"
+  # add or remove rows to match your cluster count
+)
+
+so_pos$cell_type <- annotation_map_pos[
+  as.character(so_pos@meta.data[[cluster_col_pos]])
+]
+
+cat("CD45+ cell type counts:\n")
+print(table(so_pos$cell_type))
+```
+
+### 8.2 Annotated UMAPs
+
+Create labelled UMAP for the cd45+ cells with `group.by = "cell_type"` and
+`label = TRUE`. Arrange side by side with `patchwork`.
+
+```{r annotated-umaps, fig.height=5}
+# Your code here
+
+```
+
+---
+
+## 9. Save the object
+
+```{r save}
+saveRDS(so_pos,
+        paste0("liver_cirrhosis_cd45pos_res", chosen_res_pos, ".rds"))
+
+```
+
+---
+
+## 10. Optional
+
+If you finish all of this, feel free to also examine the CD45- fraction using
+the same principles as above.
+
+### CD45− Annotation
+
+| Cell type | Canonical markers |
+|-----------|-------------------|
+| Hepatocytes | `ALB`, `APOB`, `CYP3A4`, `TTR` |
+| Cholangiocytes | `KRT19`, `KRT7`, `EPCAM`, `CFTR` |
+| ACKR1+ endothelial | `ACKR1`, `PECAM1`, `VWF` |
+| PLVAP+ endothelial | `PLVAP`, `PECAM1`, `CD34` |
+| Hepatic stellate cells | `ACTA2`, `COL1A1`, `LRAT`, `PDGFRB` |
+| Portal fibroblasts | `PDGFRA`, `COL1A1`, `DES` |
+
+
+## Session Info
+
+```{r session-info}
+sessionInfo()
+```

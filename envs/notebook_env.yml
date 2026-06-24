@@ -1,0 +1,8 @@
+name: scanpy_scrnaseq
+channels:
+- conda-forge
+- bioconda
+
+dependencies:
+- ipykernel=6.29.5
+- scanpy=1.11.1
