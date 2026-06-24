@@ -1,7 +1,7 @@
 # Single-Cell RNA-seq Workflow: BAM to Analysis with Scanpy and Seurat
 
 ## Overview
-This project recreates a single-cell RNA-seq workflow characterizing the postnatal day 7 mouse hippocampus. It covers:
+This project recreates a single-cell RNA-seq workflow characterizing the postnatal day 7 mouse hippocampus. It covers the following:
 
 1. Pre-processing raw sequencing data (BAM → FASTQ → counts matrix)  
 2. Downstream analysis and visualization using **Scanpy**  
